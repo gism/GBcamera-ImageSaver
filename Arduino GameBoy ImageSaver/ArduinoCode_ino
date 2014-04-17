@@ -1,0 +1,348 @@
+#include "pins_arduino.h"
+
+int ledPin = 2;
+
+// what to do with incoming data
+byte command = 0;
+byte compression = 0;
+byte dataLengthLSB = 0;
+byte dataLengthMSB = 0;
+unsigned int dataPosition = 0;
+byte acknowledgeCode = 129;
+byte statusCode = 0;
+
+// Buffer to put incoming data (from GB):
+byte buf [100];
+volatile byte bufPos;
+
+void setup (void){
+  
+  pinMode(ledPin, OUTPUT);
+  digitalWrite(ledPin, LOW);
+  
+  
+  // Serialdebugging
+  Serial.begin (115200);   
+  
+  // SPI CONFIGURATION
+  // ==================
+  
+  // Have to send on master in, *slave out*
+  pinMode(MISO, OUTPUT);
+  pinMode(SS, INPUT);
+  
+  // Turn on SPI in slave mode
+  SPCR &= ~_BV(MSTR);
+  
+  // Set: MSb is writen first
+  SPCR &= ~_BV(DORD);
+  
+  // Set SPI Mode 3
+  SPCR |= _BV(CPOL);  
+  SPCR |= _BV(CPHA);
+  
+  // Turn on interrupts
+  SPCR |= _BV(SPIE);
+ 
+  // Enable SPI
+  SPCR |= _BV(SPE);
+  
+  // END SPI CONFIGURATION
+  // ==================
+    
+  // Initiate buffers
+  SPDR = 0;
+  bufPos = 0;
+
+  Serial.println("GameBoy ImageSaver v0.1: Setup done.");
+  
+}  // end of setup
+
+
+// SPI interrupt routine
+ISR (SPI_STC_vect){
+  
+  if (bufPos < 100){
+    buf [bufPos++] = SPDR;
+  }  // end of room available
+    
+  switch (command){
+  case 0:
+    if (SPDR == 136){
+      // Sync mask 1
+      command = 1;
+    }
+    SPDR = 0;  
+    break;
+    
+  case 1:
+    if (SPDR == 51){
+      // Sync mask 2
+      command = 2;
+      SPDR = 0;
+    } else {
+      command = 0;
+      SPDR = 0;
+    } 
+    break;
+    
+  case 2:
+    // GBcommand code:
+    //=====================
+    // 0x01 (1) = Initialize   [NO DATA]
+    // 0x02 (2) = Print        [DATA = 0x1?]
+    // 0x03 (3) = Unknown
+    // 0x04 (4) = Data         [160x16 px]   
+    // 0x0F (15) = Inquiry     [NO DATA]
+    
+    if (SPDR == 1){
+      // Initialize
+      command = 3;
+      SPDR = 0;
+      compression = 0;
+      dataLengthLSB = 0;
+      dataLengthMSB = 0;
+    } else if (SPDR == 2){
+      // Print
+      command = 50;
+      SPDR = 0;
+    } else if (SPDR == 4){
+      // Data
+      command = 20;
+      SPDR = 0;
+    } else if (SPDR == 15){
+      // Inquiry
+      command = 90;
+      SPDR = 0;
+    } else {
+      command = 0;
+      SPDR = 5;
+    } 
+    break;
+
+  case 3:
+    // Initialize sequence - compression
+    compression = SPDR;
+    SPDR = 0;
+    command = 4;
+    break;
+    
+  case 4:
+    // Initialize sequence - Body length LSB
+    dataLengthLSB = SPDR;
+    SPDR = 0;
+    command = 5;
+    break;
+
+  case 5:
+    // Initialize sequence - Body lengthMSB
+    dataLengthMSB = SPDR;
+    SPDR = 0;
+    command = 6;
+    break; 
+    
+  case 6:
+    // Initialize sequence - Checksum LSB
+    SPDR = 0;
+    command = 7;
+    break;
+    
+  case 7:
+    // Initialize sequence - Checksum MSB
+    // Print Acknowledgement code
+    SPDR = 129; // 0x80 or 0x81
+    command = 8;
+    break;
+    
+  case 8:
+    // Initialize sequence
+    // Print Status code
+    // =============================
+    // 0000 0000 = Normal status
+    // 1XXX XXXX = Error#1: Low batteries
+    // X1XX XXXX = Error#4: Heat level at the printing head is unusual (too hot or too cold)
+    // XX1X XXXX = Error#3: Paper jam
+    // XXXX 1XXX = Ready to print
+    // XXXX X1XX = Print request
+    // XXXX XX1X = Printer busy
+    // XXXX XXX1 = Bad checksum
+    SPDR = statusCode;
+    command = 0;
+    break;
+    
+  case 20:
+    // GB is sending image data.
+    // Compression bit (GameBoy camara always sends 0)
+    compression = SPDR;
+    SPDR = 0;
+    command = 21;
+    break;
+
+  case 21:
+    // Data sequence - Data size LSB
+    dataLengthLSB = SPDR;
+    SPDR = 0;
+    command = 22;
+    break;
+    
+  case 22:
+    // Data sequence - Data size MSB
+    dataLengthMSB = SPDR;
+    SPDR = 0;
+    command = 23;
+    dataPosition = 256 * dataLengthMSB + dataLengthLSB;
+    break;
+    
+  case 23:
+    // Data sequence - Data Body
+    dataPosition = dataPosition -1;
+    // Case 65535 used when data sequence has no body.
+    if (dataPosition == 0 || dataPosition == 65535){
+      command = 24;
+    }else{
+      command = 23;
+    }
+    SPDR = 0;
+    break;
+    
+  case 24:
+    // Data sequence - Checksum LSB
+    SPDR = 0;
+    command = 25;
+    break;
+    
+  case 26:
+    // Data sequence - Checksum MSB
+    SPDR = acknowledgeCode;
+    command = 27;
+    break;
+
+  case 27:
+    // Data sequence - Acknowledgement code
+    SPDR = statusCode;
+    command = 0;
+    break;
+    
+  case 50:
+    // Print command - Compression byte
+    SPDR = 0;
+    command = 51;
+    break;
+    
+  case 51:
+    // Print command - Compression byte
+    SPDR = 0;
+    command = 52;
+    break;
+    
+  case 52:
+    // Print command - Body length LSB
+    // Body data on a print command is always 0x04h.
+    SPDR = 0;
+    command = 53;
+    break;
+   
+  case 53:
+    // Print command - Body length LSB
+    // Body data on a print command is always 0x04h.
+    SPDR = 0;
+    command = 54;
+    break;
+    
+   case 54:
+    // Print sequence - Margins. 
+    SPDR = 0;
+    command = 55;
+    break;
+    
+  case 55:
+    // Print sequence - Palette. 
+    SPDR = 0;
+    command = 56;
+    break;
+
+  case 56:
+    // Print sequence - "Ink" density or heater power.
+    SPDR = 0;
+    command = 57;
+    break;  
+    
+  case 57:
+    // Print sequence - Checksum LSB. 
+    SPDR = 0;
+    command = 58;
+    break;
+    
+  case 58:
+    // Print sequence - Checksum MSB. 
+    SPDR = acknowledgeCode;
+    command = 59;
+    break;
+    
+  case 59:
+    // Print sequence - Checksum MSB. 
+    SPDR = statusCode;
+    command = 0;
+    break;    
+    
+  case 90:
+    // GB inquiry - Compression indicator.
+    SPDR = 0;
+    command = 91;
+    break;  
+    
+  case 91:
+    // GB Inquiry - Body Length LSB.
+    SPDR = 0;
+    command = 92;
+    break; 
+    
+  case 92:
+    // GB inquiry - Body Length MSB.
+    SPDR = 0;
+    command = 93;
+    break;
+    
+  case 93:
+    // GB inquiry - Checksum length LSB.
+    SPDR = 0;
+    command = 94;
+    break;
+    
+  case 94:
+    // GB inquiry - Checksum length MSB.
+    SPDR = 129;
+    command = 95;
+    break;
+    
+  case 95:
+    // GB inquiry - Acknowledgement code.
+    SPDR = statusCode;
+    command = 0;
+    break;
+    
+  default: 
+    SPDR = 0;
+    command = 0;
+    break;
+  } // end of switch
+  //Serial.println(command);
+  
+}  // end of interrupt service routine (ISR) SPI_STC_vect
+
+void loop (void){
+  Serial.println("?");
+  while(Serial.read()!=33){
+    //LED OFF
+    digitalWrite(ledPin, LOW);
+  }
+  //LED ON
+  digitalWrite(ledPin, HIGH);
+  
+  while(1){
+    if (bufPos > 0) {
+      bufPos = bufPos - 1;
+      Serial.println(buf [bufPos],DEC);
+    }
+  } // End of while (1)
+}  // end of loop
